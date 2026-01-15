@@ -1,0 +1,251 @@
+from __future__ import annotations
+import argparse
+import gzip
+import json
+import re
+import sys
+from dataclasses import dataclass, asdict
+from functools import lru_cache
+from pathlib import Path
+from typing import Iterable, Iterator, Optional, List, Set, Tuple
+
+import razdel
+import pymorphy2
+from yargy import Parser, rule, or_
+from yargy.interpretation import fact
+from yargy.predicates import gram, eq, custom, in_caseless
+from yargy.pipelines import morph_pipeline
+
+
+# Данные 
+@dataclass(frozen=True)
+class Entry:
+    name: str
+    birth_date: Optional[str]
+    birth_place: Optional[str]
+
+
+#Морф
+_morph = pymorphy2.MorphAnalyzer()
+
+@lru_cache(maxsize=50_000)
+def _grammemes(token: str) -> frozenset[str]:
+    grams: set[str] = set()
+    for p in _morph.parse(token):
+        grams.update(p.tag.grammemes)
+    return frozenset(grams)
+
+
+def _has(token: str, gram_code: str) -> bool:
+    return gram_code in _grammemes(token)
+
+
+@lru_cache(maxsize=50_000)
+def _as_person_token(token: str) -> str:
+    if not token:
+        return token
+    for p in _morph.parse(token):
+        if {"Name", "Surn", "Patr"} & set(p.tag.grammemes):
+            nf = p.normal_form
+            return "-".join(part.capitalize() for part in nf.split("-"))
+    return token
+
+
+@lru_cache(maxsize=50_000)
+def _as_place(text: str) -> str:
+    if not text:
+        return text
+    raw = re.split(r"\s+", text.strip())
+    out: List[str] = []
+    for t in raw:
+        t = t.strip(",.;:()[]{}\"'«»")
+        if not t:
+            continue
+        nf = _morph.parse(t)[0].normal_form
+        out.append("-".join(part.capitalize() for part in nf.split("-")))
+    return " ".join(out) if out else text
+
+
+#Грамматики Yargy 
+
+NameFact = fact("Name", ["first", "last", "middle"])
+
+FIRST_LIKE = custom(lambda w: len(w) >= 3 and _has(w, "Name") and not _has(w, "Surn"))
+LAST_LIKE  = custom(lambda w: len(w) >= 3 and _has(w, "Surn"))
+MIDDLE_LIKE = gram("Patr")
+
+FIRST  = rule(FIRST_LIKE).interpretation(NameFact.first)
+LAST   = rule(LAST_LIKE).interpretation(NameFact.last)
+MIDDLE = rule(MIDDLE_LIKE).interpretation(NameFact.middle)
+
+FULL_NAME = or_(
+    rule(FIRST, LAST, MIDDLE.optional()),
+    rule(LAST, FIRST, MIDDLE.optional()),
+).interpretation(NameFact)
+
+_name_parser = Parser(FULL_NAME)
+
+
+BirthFact = fact("Birth", ["place", "year"])
+
+YEAR4 = custom(lambda s: bool(re.fullmatch(r"\d{4}", s)))
+YEAR = rule(YEAR4).interpretation(BirthFact.year)
+
+TOWN_ABBR = in_caseless({"г", "город", "с", "село", "д", "деревня", "пос", "посёлок"})
+REGION = morph_pipeline(["область", "край", "республика", "район", "округ"])
+
+PLACE = rule(
+    TOWN_ABBR.optional(),
+    or_(gram("Geox"), gram("Name"), gram("Surn"), gram("Patr")),
+    REGION.optional(),
+).interpretation(BirthFact.place)
+
+BIRTH_TRIGGER = or_(
+    rule(in_caseless({"родился", "родилась", "уроженец", "уроженка"})),
+    rule(in_caseless("родом"), eq("из")),
+)
+
+BIRTH_COMPLEX = or_(
+    rule(BIRTH_TRIGGER, eq("в").optional(), YEAR.optional(), eq("в").optional(), PLACE.optional()),
+    rule(BIRTH_TRIGGER, eq("в").optional(), PLACE, YEAR.optional()),
+)
+
+BIRTH_BY_LABEL = or_(
+    rule(in_caseless("дата"), in_caseless("рождения"), eq(":").optional(), YEAR),
+    rule(in_caseless("место"), in_caseless("рождения"), eq(":").optional(), PLACE),
+)
+
+BIRTH_RULE = or_(BIRTH_COMPLEX, BIRTH_BY_LABEL).interpretation(BirthFact)
+
+_birth_parser = Parser(BIRTH_RULE)
+
+
+# Извлечение
+def _pick_best_birth(matches) -> Tuple[Optional[str], Optional[str]]:
+    if not matches:
+        return None, None
+    
+    def score(m) -> int:
+        f = m.fact
+        return (2 if f.place else 0) + (1 if f.year else 0)
+    
+    m = max(matches, key=score)
+    f = m.fact
+    year = f.year if f.year else None
+    place = _as_place(f.place) if f.place else None
+    return year, place
+
+
+def extract_entries(text: str) -> List[Entry]:
+    result: List[Entry] = []
+    seen_in_text: Set[str] = set()
+
+    for sent in razdel.sentenize(text):
+        s = sent.text
+        
+        people = list(_name_parser.findall(s))
+        if not people:
+            continue
+            
+        year, place = _pick_best_birth(list(_birth_parser.findall(s)))
+        
+        for m in people:
+            f = m.fact
+            parts = [
+                _as_person_token(f.first),
+                _as_person_token(f.last),
+                _as_person_token(f.middle) if f.middle else "",
+            ]
+            full_name = " ".join(p for p in parts if p).strip()
+            
+            if not full_name or full_name in seen_in_text:
+                continue
+                
+            seen_in_text.add(full_name)
+            result.append(Entry(
+                name=full_name,
+                birth_date=year,
+                birth_place=place
+            ))
+    
+    return result
+
+
+# Ввод/вывод
+def iter_texts_from_path(path: Path, *, tsv_col: int = 2, encoding: str = "utf-8") -> Iterator[str]:
+    if path.suffix.lower() == ".gz":
+        with gzip.open(path, "rt", encoding=encoding, errors="replace") as f:
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) > tsv_col and parts[tsv_col].strip():
+                    yield parts[tsv_col]
+        return
+    yield path.read_text(encoding=encoding, errors="replace")
+
+
+def collect_entries(texts: Iterable[str], *, dedup_global: bool = True) -> List[Entry]:
+    all_entries: List[Entry] = []
+    seen: Set[str] = set()
+    
+    for t in texts:
+        for e in extract_entries(t):
+            if dedup_global and e.name in seen:
+                continue
+            seen.add(e.name)
+            all_entries.append(e)
+    return all_entries
+
+
+def write_entries(entries: List[Entry], out_stream) -> None:
+    """Вывод всегда в формате красивого JSON"""
+    json.dump(
+        [asdict(e) for e in entries],
+        out_stream,
+        ensure_ascii=False,
+        indent=2
+    )
+    out_stream.write("\n")
+
+
+# командная строка
+def build_argparser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(
+        prog="extract_births.py",
+        description="Извлечение (ФИО, год рождения, место рождения) из русскоязычных текстов",
+    )
+    p.add_argument("-i", "--input", required=True,
+                   help="Входной файл (.txt или .gz TSV)")
+    p.add_argument("-o", "--output", default="-",
+                   help="Выходной файл или - (stdout)")
+    p.add_argument("--tsv-col", type=int, default=2,
+                   help="Номер колонки с текстом в .gz TSV (с 0)")
+    p.add_argument("--no-dedup", action="store_true",
+                   help="Не убирать дубликаты имён глобально")
+    p.add_argument("--encoding", default="utf-8")
+    return p
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    args = build_argparser().parse_args(argv)
+    in_path = Path(args.input)
+    
+    if not in_path.exists():
+        print(f"[error] входной файл не найден: {in_path}", file=sys.stderr)
+        return 2
+
+    texts = iter_texts_from_path(in_path, tsv_col=args.tsv_col, encoding=args.encoding)
+    entries = collect_entries(texts, dedup_global=not args.no_dedup)
+
+    if args.output == "-":
+        write_entries(entries, sys.stdout)
+        return 0
+
+    out_path = Path(args.output)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    with out_path.open("w", encoding=args.encoding, newline="") as f:
+        write_entries(entries, f)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
